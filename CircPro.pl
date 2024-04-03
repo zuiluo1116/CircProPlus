@@ -1,0 +1,609 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use File::Path;
+use Getopt::Long;
+use Bio::SeqIO;
+use Bio::Perl;
+my ($circ_in, $out, $ref_file, $gtf, $help, $species, $max_thread, $ribo_adaptor, $ribo_in, $rrna_file, $overlap_len);
+Getopt::Long::GetOptions(
+        'circ_in|C=s'        =>        \$circ_in,
+        'ribo_in|R=s'        =>        \$ribo_in,
+        'out|O=s'        =>        \$out,
+        'ref_file|ref=s'        =>        \$ref_file,
+        'rRNA_file|rRNA=s'        =>        \$rrna_file,
+        'gene_anno|G=s'        =>        \$gtf,
+        'adaptor|A=s'        =>        \$ribo_adaptor,
+        'help|H!'        =>        \$help,
+        'model|M=s'        =>        \$species,
+        'thread_num|T=i'        =>        \$max_thread,
+        'overlap_len|L=i'        =>        \$overlap_len,
+);
+if(!defined($circ_in) and !defined($help) and !defined($ref_file) and !defined($ribo_in) and !defined($species) and !defined($gtf)){
+        print "Please use the --help or -H option to get usage information.\n";
+}elsif(defined($help)){
+        print '
+Program:  circpro
+Contact:  xianwen@zju.edu.cn
+
+Usage:    perl CircPro.pl -c TotalRNASeq.fastq -o OutputDir -ref Genome.fa -g Gene.gtf -m ve -r RiboSeq.fastq -rRNA rRNA.fa -a Adaptor -t N
+
+Arguments:
+    -C, --circ_in
+          FASTQ file from total/poly(A)- RNA-Seq. Paired-end FASTQ files should be separated by ",", e.g. "-C file_1.fastq,file_2.fastq". Multiple FASTQ files should be separated by ":", e.g. "-C file1.fastq:file2.fastq:file3.fastq".
+    -R, --ribo_in
+          FASTQ file from Ribo-Seq. Paired-end FASTQ files should be separated by ",", e.g. "-R file_1.fastq,file_2.fastq". Multiple FASTQ files should be separated by ":", e.g. "-R file1.fastq:file2.fastq:file3.fastq".
+    -O, --out
+          output dir
+    -ref, --ref_file
+          reference genome sequence in FASTA format
+    -rRNA, --rRNA_file
+          rRNA sequence in FASTA format (optional)
+    -G, --gene_anno
+          input GTF/GFF3 formatted annotation file name
+    -A, --adaptor
+          adaptor string (optional)
+    -H, --help
+          show help information
+    -M, --model
+          CNCI classification model ("ve" for vertebrate species, "pl" for plant species)
+    -T, --thread_num
+          number of threads for parallel running (default: 1)
+    -L, --overlap_len
+          minimal overlap length between Ribo-Seq reads and junction region (in each direction). (default: 5)
+';
+}else{
+        print "CircPro started!\nSequence mapping ...\n";
+        if(!defined $out){
+          $out="./";
+        }
+        mkpath("$out/temp");
+        if(!defined $max_thread){
+          $max_thread=1;
+        }
+        if(!defined $overlap_len){
+          $overlap_len=5;
+        }
+        my $ref_input_dir;
+        if(rindex($ref_file, "/") >= 0){
+          $ref_input_dir = substr($ref_file, 0, rindex($ref_file, "/")+1);
+        }else{
+          $ref_input_dir = "./";
+        }
+        system "bwa index -a bwtsw $ref_file";
+        my $input_dir;
+        if(rindex($circ_in, "/") >= 0){
+          $input_dir = substr($circ_in, 0, rindex($circ_in, "/")+1);
+        }else{
+          $input_dir = "./";
+        }
+        if($circ_in =~ /,/){
+          $circ_in =~ s/,/ /;
+          system "bwa mem -v 1 -t $max_thread $ref_file $circ_in > $out/temp/bwa_result.sam";
+        }elsif($circ_in =~ /:/){
+          $circ_in =~ s/:/ /g;
+          system "cat $circ_in > $out/temp/circ_in.fastq";
+          system "bwa mem -v 1 -t $max_thread $ref_file $out/temp/circ_in.fastq > $out/temp/bwa_result.sam";
+        }else{
+          system "bwa mem -v 1 -t $max_thread $ref_file $circ_in > $out/temp/bwa_result.sam";
+        }
+        print "Done!\n";
+        ## Done
+        ## Detecting circRNAs
+        print "Detecting circRNAs ...";
+        system "perl /user/public/circpro/CircPro/CIRI_v2.0.5.pl -I $out/temp/bwa_result.sam -O $out/temp/ciri_result.out -F $ref_file -low -T $max_thread -A $gtf -Q";
+        open(IN1,"<$out/temp/ciri_result.out") || die $! ;
+        my $line_n=0;
+        my $check=0;
+        while(<IN1>){
+          $line_n++;
+          if($line_n>1){
+            $check=1;
+            last;
+          }
+        }
+        if($check == 0){
+          print "\nWarning: CIRI2 detected 0 circRNA!\nStoped!\n";
+          exit;
+        }
+        close(IN1);
+        print "Done\n";
+        ## Done
+        ## circRNA Sequence
+        print "Extracting circRNA sequence ...";
+        open(IN2,"<$ref_file") || die $!;
+        my $pos;
+        my @chrs;
+        while(<IN2>){
+          if(/>(.*?)[ |\s]/){
+            push(@chrs,$1);
+            open(OUT1,">$out/temp/$1.fa") || die $!;
+            print OUT1 ">$1\n";
+            while(<IN2>){
+              if(/^>/){
+                seek(IN2,$pos,0);
+                last;
+              }
+              else{
+                print OUT1;
+                $pos=tell(IN2);
+              }
+            }
+            close(OUT1);
+          }
+        }
+        close(IN2);
+        my (%hash,$seqIO,$seq);
+        foreach my $chr (@chrs){
+          $seqIO = Bio::SeqIO->new( -file => "$out/temp/$chr.fa", -format => 'fasta');
+          $seq = $seqIO->next_seq()->seq();
+          $hash{"$chr"}=$seq;
+        }
+        open(IN3,"<$gtf") || die $!;
+        open(CIRI,"<$out/temp/ciri_result.out") || die $! ;
+        open(SEQ,">$out/temp/circRNA_temp.fa") || die $! ;
+        readline(CIRI);
+        my %circs;
+        my %circ_list;
+        my %circpos;
+        my %circ_seq_final;
+        my %othercirc;
+        my %introniccirc;
+        my %intergeniccirc;
+        my $pos_t;
+        while(<CIRI>){
+          my @row=split/\t/;
+          $circs{"$row[1]\t$row[2]\t$row[3]\t$row[10]"}=1;
+          $circ_list{"$row[1]:$row[2]|$row[3]"}="$row[1]:$row[2]|$row[3]\t$row[1]\t$row[2]\t$row[3]\t$row[10]\t$row[4]";
+        }
+        my %circ_host;
+        my %allintrons;
+        while(<IN3>){
+          if(/^(.*?)\t.*\ttranscript\t(\d+)\t(\d+)\t.\t(.).*gene_id \"(.*?)\"/ || /^(.*?)\t.*\tmRNA\t(\d+)\t(\d+)\t.\t(.).*Parent=(.*?);/){
+            my ($chrG,$startG,$endG,$strandG,$G)=($1,$2,$3,$4,$5);
+            my $pos_gtf=tell(IN3);
+            foreach (keys %circs){
+            	seek(IN3,$pos_gtf,0);
+              my ($chrC,$startC,$endC,$strandC)=split/\t/;
+              if($chrC eq $chrG && $strandC eq $strandG){
+                next if ($startC > $endG || $endC < $startG);
+                my %introns=();
+                my $circ_id="$G\t$chrC\t$startC\t$endC\t$strandC";
+                my $circseq="";
+                if($strandG eq "+"){
+                  my $intron_s=0;
+                  while(<IN3>){
+                    if(/\texon\t(\d+)\t(\d+)/){
+                     if($intron_s == 0){
+                      $intron_s=$2+1;
+                     }
+                     else{
+                      my $intron_e=$1-1;
+                      $introns{"$intron_s\t$intron_e"}=1;
+                      $allintrons{"$chrG\t$intron_s\t$intron_e\t$strandG"}=$G;
+                      $intron_s=$2+1;
+                     }
+                    }
+                    if(/\tgene\t/ || /\ttranscript\t/ || /\tmRNA\t/){
+                      last;
+                    }
+                  }
+                  my %temp=();
+                  $temp{"$startC\t$endC"}=1;
+                  my $intron_check=1;
+                  foreach (sort{$a cmp $b} keys %introns){
+                    my @intron_info=split/\t/;
+                    if($intron_info[0]<$startC && $intron_info[1]>$endC){
+                      $intron_check=0;
+                      last;
+                    }
+                    foreach (sort{$a cmp $b} keys %temp){
+                      my @temp_k=split/\t/;
+                      if($intron_info[0]>$temp_k[0] && $intron_info[1]<$temp_k[1]){
+                        $temp{$temp_k[0]."\t".($intron_info[0]-1)}=1;
+                        $temp{($intron_info[1]+1)."\t".$temp_k[1]}=1;
+                        delete $temp{$temp_k[0]."\t".$temp_k[1]};
+                        last;
+                      }
+                    }
+                  }
+                  next if ($intron_check==0);
+                  my %temp1=();
+                  foreach (keys %temp){
+                    my @ks=split/\t/;
+                    $temp1{$ks[0]}=$_;
+                  }
+                  foreach (sort{$a<=>$b} keys %temp1){
+                    my @position=split/\t/,$temp1{$_};
+                    $circ_id .= "\t$position[0]\t$position[1]";
+                    my $temp_Seq = substr($hash{$chrC},$position[0]-1,$position[1]-$position[0]+1);
+                    $circseq .= $temp_Seq;
+                  }
+                  if($circ_host{"$chrC\t$startC\t$endC\t$strandC"}){
+                    if($circ_host{"$chrC\t$startC\t$endC\t$strandC"} ne $G){
+                      $othercirc{"$chrC\t$startC\t$endC\t$strandC"}=1;
+                      next;
+                    }
+                  }else{
+                    $circ_host{"$chrC\t$startC\t$endC\t$strandC"}=$G;
+                  }
+                  $circ_seq_final{$circ_id}=$circseq;
+                }else{
+                  my $intron_e=0;
+                  while(<IN3>){
+                    if(/\texon\t(\d+)\t(\d+)/){
+                      if($intron_e == 0){
+                        $intron_e=$1-1;
+                      }else{
+                        my $intron_s=$2+1;
+                        $introns{"$intron_s\t$intron_e"}=1;
+                        $allintrons{"$chrG\t$intron_s\t$intron_e\t$strandG"}=$G;
+                        $intron_e=$1-1;
+                      }
+                    }
+                    if(/\tgene\t/ || /\ttranscript\t/ || /\tmRNA\t/){
+                      last;
+                    }
+                  }
+                  my %temp=();
+                  $temp{"$startC\t$endC"}=1;
+                  my $intron_check=1;
+                  foreach (sort{$a cmp $b} keys %introns){
+                    my @intron_info=split/\t/;
+                    if($intron_info[0]<$startC && $intron_info[1]>$endC){
+                      $intron_check=0;
+                      last;
+                    }
+                    foreach (sort{$a cmp $b} keys %temp){
+                      my @temp_k=split/\t/;
+                      if($intron_info[0]>$temp_k[0] && $intron_info[1]<$temp_k[1]){
+                        $temp{$temp_k[0]."\t".($intron_info[0]-1)}=1;
+                        $temp{($intron_info[1]+1)."\t".$temp_k[1]}=1;
+                        delete $temp{$temp_k[0]."\t".$temp_k[1]};
+                        last;
+                      }
+                    }
+                  }
+                  next if ($intron_check==0);
+                  my %temp1=();
+                  foreach (keys %temp){
+                    my @ks=split/\t/;
+                    $temp1{$ks[0]}=$_;
+                  }
+                  foreach (sort{$b<=>$a} keys %temp1){
+                    my @position=split/\t/,$temp1{$_};
+                    $circ_id .= "\t$position[0]\t$position[1]";
+                    my $temp_Seq = substr($hash{$chrC},$position[0]-1,$position[1]-$position[0]+1);
+                    my $rev = Bio::Seq->new(-id => 'testseq', -seq => $temp_Seq);
+                    $rev = revcom($rev);
+                    $temp_Seq = $rev->seq();
+                    $circseq .= $temp_Seq;
+                  }
+                  if($circ_host{"$chrC\t$startC\t$endC\t$strandC"}){
+                    if($circ_host{"$chrC\t$startC\t$endC\t$strandC"} ne $G){
+                      $othercirc{"$chrC\t$startC\t$endC\t$strandC"}=1;
+                      next;
+                    }
+                  }else{
+                    $circ_host{"$chrC\t$startC\t$endC\t$strandC"}=$G;
+                  }
+                  $circ_seq_final{$circ_id}=$circseq;
+                }
+              }
+            }
+            seek(IN3,$pos_gtf,0);
+          }
+        }
+        foreach my $k_circ_seq_final (keys %circ_seq_final){
+          my @row=split/\t/,$k_circ_seq_final;
+          delete $circs{"$row[1]\t$row[2]\t$row[3]\t$row[4]"};
+          if($othercirc{"$row[1]\t$row[2]\t$row[3]\t$row[4]"}){
+            delete $circ_seq_final{$k_circ_seq_final};
+          }
+        }
+        foreach my $k_circ_seq_final (keys %circ_seq_final){
+          my @row=split/\t/,$k_circ_seq_final;
+          $circ_list{"$row[1]:$row[2]|$row[3]"} .= "\texonic\t$row[0]";
+          print SEQ ">$row[1]:$row[2]|$row[3]\n$circ_seq_final{$k_circ_seq_final}\n";##exonic
+        }
+        foreach (keys %othercirc){
+          my @row=split/\t/;
+          $circ_list{"$row[0]:$row[1]|$row[2]"} .= "\tother\tn/a";
+          if($row[3] eq "+"){
+            my $temp_Seq = substr($hash{$row[0]},$row[1]-1,$row[2]-$row[1]+1);
+            print SEQ ">$row[0]:$row[1]|$row[2]\n$temp_Seq\n";##other
+          }else{
+            my $temp_Seq = substr($hash{$row[0]},$row[1]-1,$row[2]-$row[1]+1);
+            my $rev = Bio::Seq->new(-id => 'testseq', -seq => $temp_Seq);
+            $rev = revcom($rev);
+            $temp_Seq = $rev->seq();
+            print SEQ ">$row[0]:$row[1]|$row[2]\n$temp_Seq\n";##other
+          }
+        }
+        foreach (keys %circs){
+          my $check_intron=0;
+          my @row_circs=split/\t/;
+          foreach (keys %allintrons){
+            my @row_intron=split/\t/;
+            if($row_circs[0] eq $row_intron[0] && $row_circs[3] eq $row_intron[3] && $row_circs[1] >= $row_intron[1] && $row_circs[2] <= $row_intron[2]){
+              $check_intron=1;
+              $circ_list{"$row_circs[0]:$row_circs[1]|$row_circs[2]"} .= "\tintronic\t".$allintrons{"$row_intron[0]\t$row_intron[1]\t$row_intron[2]\t$row_intron[3]"};
+              if($row_circs[3] eq "+"){
+                my $temp_Seq = substr($hash{$row_circs[0]},$row_circs[1]-1,$row_circs[2]-$row_circs[1]+1);
+                print SEQ ">$row_circs[0]:$row_circs[1]|$row_circs[2]\n$temp_Seq\n";##intronic
+              }else{
+                my $temp_Seq = substr($hash{$row_circs[0]},$row_circs[1]-1,$row_circs[2]-$row_circs[1]+1);
+                my $rev = Bio::Seq->new(-id => 'testseq', -seq => $temp_Seq);
+                $rev = revcom($rev);
+                $temp_Seq = $rev->seq();
+                print SEQ ">$row_circs[0]:$row_circs[1]|$row_circs[2]\n$temp_Seq\n";##intronic
+              }
+            }
+          }
+          if($check_intron==0){
+            $circ_list{"$row_circs[0]:$row_circs[1]|$row_circs[2]"} .= "\tintergenic\tn/a";
+            if($row_circs[3] eq "+"){
+              my $temp_Seq = substr($hash{$row_circs[0]},$row_circs[1]-1,$row_circs[2]-$row_circs[1]+1);
+              print SEQ ">$row_circs[0]:$row_circs[1]|$row_circs[2]\n$temp_Seq\n";##intergenic
+            }else{
+              my $temp_Seq = substr($hash{$row_circs[0]},$row_circs[1]-1,$row_circs[2]-$row_circs[1]+1);
+              my $rev = Bio::Seq->new(-id => 'testseq', -seq => $temp_Seq);
+              $rev = revcom($rev);
+              $temp_Seq = $rev->seq();
+              print SEQ ">$row_circs[0]:$row_circs[1]|$row_circs[2]\n$temp_Seq\n";##intergenic
+            }
+          }
+        }
+        open(CIRCLIST,">$out/temp/circlist.out") || die $!;
+        foreach (keys %circ_list){
+          print CIRCLIST $circ_list{$_}."\n";
+        }
+        close(CIRCLIST);
+        close(CIRI);
+        close(SEQ);
+        close(IN3);
+        open(SEQIN,"<$out/temp/circRNA_temp.fa") || die $!;
+        open(SEQOUT,">$out/circRNA.fa") || die $!;
+        open(CPCFILE,">$out/temp/cpcIN.fa") || die $!;
+        my %circids;
+        my %circseq_final;
+        while(<SEQIN>){
+          if(/^(>.*)/){
+            chomp(my $circseq_temp=<SEQIN>);
+            if($circids{$1}){
+              $circids{$1}++;
+              $circseq_final{$1."_".$circids{$1}}=$circseq_temp;
+            }
+            else{
+                    $circids{$1}=1;
+              $circseq_final{$1."_1"}=$circseq_temp;
+            }
+          }
+        }
+        foreach (sort{$a cmp $b} keys %circseq_final){
+          print SEQOUT $_."\n".$circseq_final{$_}."\n";
+          print CPCFILE $_."\n".$circseq_final{$_}.$circseq_final{$_}."\n";
+        }
+        close(SEQIN);
+        close(SEQOUT);
+        close(CPCFILE);
+        print "Done!\n";
+        ## Done
+        ## CPC&Ribo-seq
+        print "Predicting circRNA protein coding potential ...";
+        system "mkdir $out/temp/CPC.out/";
+        system "sh ./cpc-0.9-r2/bin/run_predict.sh $out/temp/cpcIN.fa $out/temp/CPC.out/CPC $out/temp/CPC.out/ $out/temp/CPC.out/CPC_evidence";
+        print "Done!\n";
+        print "Extracting junction reads from Ribo-Seq data ...";
+        system "bowtie2-build -q $ref_file $ref_file";
+        my ($ribo_in1,$ribo_in2,$seq_len);
+        if($ribo_in =~ /(.*),(.*)/){
+          $ribo_in1=$1;
+          $ribo_in2=$2;
+          open (RIBO,"<$ribo_in1") || die $! ;
+          readline(RIBO);
+          chomp(my $seq_tem=<RIBO>);
+          $seq_len=length($seq_tem);
+          close(RIBO);
+          if(defined $ribo_adaptor){
+            system "fastx_clipper -a $ribo_adaptor -c -i $ribo_in1 -o $out/temp/ribo_in1.filter";
+            system "fastx_clipper -a $ribo_adaptor -c -i $ribo_in2 -o $out/temp/ribo_in2.filter";
+            if(defined $rrna_file){
+              system "bowtie2-build -q $rrna_file $rrna_file";
+              system "bowtie2 --quiet -p $max_thread -x $rrna_file -1 $out/temp/ribo_in1.filter -2 $out/temp/ribo_in2.filter -S $out/temp/ribo_rrna.out.sam";
+              system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+              system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }else{
+              system "bowtie2 --quiet -p $max_thread -x $ref_file -1 $out/temp/ribo_in1.filter -2 $out/temp/ribo_in2.filter | samtools view -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }else{
+                  if(defined $rrna_file){
+              system "bowtie2-build -q $rrna_file $rrna_file";
+              system "bowtie2 --quiet -p $max_thread -x $rrna_file -1 $ribo_in1 -2 $ribo_in2 -S $out/temp/ribo_rrna.out.sam";
+              system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+              system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }else{
+              system "bowtie2 --quiet -p $max_thread -x $ref_file -1 $ribo_in1 -2 $ribo_in2 | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }
+        }elsif($ribo_in =~ /:/){
+          my @ribo_files=split/:/,$ribo_in;
+          open(RIBO,"<$ribo_files[0]") || die $! ;
+          readline(RIBO);
+          chomp(my $seq_tem=<RIBO>);
+          $seq_len=length($seq_tem);
+          close(RIBO);
+          my $ribo_input_file="";
+          if(defined $ribo_adaptor){
+            my $i=0;
+            foreach (@ribo_files){
+                    $i++;
+              system "fastx_clipper -a $ribo_adaptor -c -i $_ -o $out/temp/ribo_in$i.filter";
+              $ribo_input_file .= "$out/temp/ribo_in$i.filter,";
+            }
+            if(defined $rrna_file){
+              system "bowtie2-build -q $rrna_file $rrna_file";
+              system "bowtie2 --quiet -p $max_thread -x $rrna_file -U $ribo_input_file -S $out/temp/ribo_rrna.out.sam";
+              system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+              system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }else{
+              system "bowtie2 --quiet -p $max_thread -x $ref_file -U $ribo_input_file | samtools view -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }else{
+            if(defined $rrna_file){
+              $ribo_in =~ s/:/,/g;
+              system "bowtie2-build -q $rrna_file $rrna_file";
+              system "bowtie2 --quiet -p $max_thread -x $rrna_file -U $ribo_in -S $out/temp/ribo_rrna.out.sam";
+              system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+              system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }else{
+              $ribo_in =~ s/;/ /g;
+              system "bowtie2 --quiet -p $max_thread -x $ref_file $ribo_in | samtools view -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }
+        }else{
+          open(RIBO,"<$ribo_in") || die $! ;
+          readline(RIBO);
+          chomp(my $seq_tem=<RIBO>);
+          $seq_len=length($seq_tem);
+          close(RIBO);
+          if(defined $ribo_adaptor){
+            system "fastx_clipper -a $ribo_adaptor -c -i $ribo_in -o $out/temp/ribo_in.filter";
+            if(defined $rrna_file){
+              system "bowtie2-build -q $rrna_file $rrna_file";
+              system "bowtie2 --quiet -p $max_thread -x $rrna_file $out/temp/ribo_in.filter -S $out/temp/ribo_rrna.out.sam";
+              system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+              system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }else{
+              system "bowtie2 --quiet -p $max_thread -x $ref_file $ribo_in | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }else{
+                  if(defined $rrna_file){
+                    system "bowtie2-build -q $rrna_file $rrna_file";
+                    system "bowtie2 --quiet -p $max_thread -x $rrna_file $ribo_in -S $out/temp/ribo_rrna.out.sam";
+                    system "samtools view -@ $max_thread -f4 $out/temp/ribo_rrna.out.sam | awk -f awk-f > $out/temp/riboseq.fa";
+                    system "bowtie2 --quiet -f -p $max_thread -x $ref_file $out/temp/riboseq.fa | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+                  }else{
+              system "bowtie2 --quiet -p $max_thread -x $ref_file $ribo_in | samtools view -@ $max_thread -f4 | awk -f awk-f > $out/temp/ribo_unaln_temp.fa";
+            }
+          }
+        }
+        open(IN4,"$out/temp/ribo_unaln_temp.fa") || die $!;
+        open(RIBOAD,">$out/temp/ribo_unaln.fa") || die $!;
+        while(<IN4>){
+          if(/^>/){
+            chomp;
+            print RIBOAD;
+            my $ribo_unaln_seq=<IN4>;
+            my $length_riboseq=length($ribo_unaln_seq)-1;
+            print RIBOAD "_$length_riboseq\n$ribo_unaln_seq";
+          }
+        }
+        close(IN4);
+        close(RIBOAD);
+        open(IN5,"$out/circRNA.fa") || die $!;
+        open(RIBOREF,">$out/temp/ribo_ref.fa") || die $!;
+        while(<IN5>){
+          chomp;
+          print RIBOREF;
+          if(/^>(.*)/){
+            my $circname=$1;
+            chomp(my $circ_seq=<IN5>);
+            my $circ_len=length($circ_seq);
+            print RIBOREF "_".$circ_len."\n";
+            my $riboref_seq;
+            if($circ_len > (2*$seq_len)){
+              $riboref_seq=substr($circ_seq,$circ_len-$seq_len,$seq_len).substr($circ_seq,0,$seq_len);
+            }else{
+              $riboref_seq=substr($circ_seq,$circ_len-int($circ_len/2),int($circ_len/2)).substr($circ_seq,0,int($circ_len/2));
+            }
+            print RIBOREF $riboref_seq."\n";
+          }
+        }
+        close(IN5);
+        close(RIBOREF);
+        system "bowtie2-build -q $out/temp/ribo_ref.fa $out/temp/ribo_ref.fa";
+        system "bowtie2 --quiet -p $max_thread -f -x $out/temp/ribo_ref.fa $out/temp/ribo_unaln.fa | samtools view -@ $max_thread -Sb | bamToBed -i > $out/temp/ribo_aln.out.bed";
+        my %circ_result;
+        my %circ_ribo_counts;
+        open(CIRCRE,"<$out/temp/circlist.out") || die $!;
+        while(<CIRCRE>){
+          chomp;
+          my @row=split/\t/;
+          $circ_ribo_counts{$row[0]}=0;
+          $circ_result{$row[0]}="$row[0]\t$row[1]\t$row[2]\t$row[3]\t$row[4]\t$row[5]\t$row[6]\t$row[7]";
+        }
+        close(CIRCRE);
+        open(IN6,"$out/temp/ribo_aln.out.bed") || die $!;
+        while(<IN6>){
+          next if(/\t-$/);
+          my @bed_rows=split/\t/;
+          my ($circ_name,$circ_iso,$circ_length)=split/_/,$bed_rows[0];
+          my ($ribo_name,$ribo_length)=split/_/,$bed_rows[3];
+          next if($circ_length < $ribo_length);
+          if($circ_length > 2*$seq_len){
+            if($bed_rows[1] <= $seq_len-$overlap_len && $bed_rows[2] >= $seq_len+$overlap_len){
+              $circ_ribo_counts{$circ_name}=$circ_ribo_counts{$circ_name}+1;
+            }
+          }else{
+            if($bed_rows[1] <= 1/2*$circ_length-$overlap_len && $bed_rows[2] >= 1/2*$circ_length+$overlap_len){
+              $circ_ribo_counts{$circ_name}=$circ_ribo_counts{$circ_name}+1;
+            }
+          }
+        }
+        close(IN6);
+        open(FINAL,">$out/CircPro.out") || die $!;
+        print FINAL "circRNA\tchr\tstart\tend\tstrand\tjunction reads (RNA-Seq)\ttype\tparent gene\tjunction reads (Ribo-Seq)\n";
+        foreach (sort{$a cmp $b}keys %circ_result){
+          print FINAL $circ_result{$_}."\t".$circ_ribo_counts{$_}."\n";
+        }
+        close(FINAL);
+        print "Done!\n";
+        print "Extracting circRNA isoforms and potential protein sequences ...";
+        my %circ_cpc_result;
+        my %classification;
+        open(IN7,"$out/temp/CPC.out/CPC") || die $!;
+        while(<IN7>){
+          chomp();
+          my @cpc_out=split/\t/;
+          $circ_cpc_result{$cpc_out[0]}=$cpc_out[2]."\t".$cpc_out[3];
+          $classification{$cpc_out[0]}=$cpc_out[2];
+        }
+        close(IN7);
+        open(IN8,"$out/temp/CPC.out/CPC_evidence.orf") || die $!;
+        while(<IN8>){
+          my @orf_out=split/\t/;
+          $circ_cpc_result{$orf_out[0]}=$circ_cpc_result{$orf_out[0]}."\t".($orf_out[3]-$orf_out[2]+1);
+        }
+        close(IN8);
+        open(CIRCCPC,">$out/circIsoform.out") || die $!;
+        print CIRCCPC "circRNA\tclassification\tCPC score\tORF length\n";
+        foreach (sort{$a cmp $b} keys %circ_cpc_result){
+          print CIRCCPC "$_\t$circ_cpc_result{$_}\n";
+        }
+        close(CIRCCPC);
+        open(IN9,"$out/temp/CPC.out/ff.fa") || die $!;
+        open(PRO,">$out/circProtein.fa") || die $!;
+        while(<IN9>){
+          if(/^>(.*?) /){
+            if($classification{$1} eq "coding"){
+              print PRO ">$1\n";
+              while(<IN9>){
+                if(/^>/){
+                  seek(IN9,$pos,0);
+                  last;
+                }
+                print PRO;
+                $pos=tell(IN9);
+              }
+            }
+          }
+        }
+        close(IN9);
+        close(PRO);
+        system "rm -rf $out/temp/";
+        ## Done
+        print "Done!\n";
+        print "CircPro completed!\n";
+}
